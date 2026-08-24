@@ -119,7 +119,7 @@ Pin pipelines to a semver tag (`X.Y.Z`), not `:latest` — that's what `((immich
 
 **Why `e2e` doesn't run on every PR:** standing up Postgres + Redis + the Immich server/ML services is real time and real image-pull weight per run, and this is a small `put`-only resource where a broken Dockerfile (caught by `build-validate`) is the far more common failure mode. `e2e` instead runs post-merge on `main` as a continuous canary against whatever Immich currently ships as its latest release — so if a future Immich release changes one of the API shapes documented above (an upsert response shape, a required upload field, etc.), this surfaces as a red job on `main` rather than as a silent break discovered in production. It is intentionally not wired as a required check on `publish`: a canary catching upstream API drift shouldn't block cutting a release of code that hasn't changed.
 
-**One-time manual step:** the first successful `publish` run creates the GHCR package but it defaults to private. Go to the package's settings on GitHub (`gavmor/immich-concourse-resource` → Packages) and set visibility to public / link it to the repo, or `docker pull` will 401 for anyone without registry auth. GITHUB_TOKEN can't do this itself — GHCR's visibility inheritance from a public repo only applies to packages created via the repo's own "Packages" UI flow, not the first API/registry push.
+No manual visibility step needed: verified directly against the live package after the first `publish` run — `ghcr.io/gavmor/immich-concourse-resource` is pullable with an anonymous registry token, no auth required. GHCR packages pushed via `GITHUB_TOKEN` from a public repo inherit that repo's public visibility automatically.
 
 ## Building
 
