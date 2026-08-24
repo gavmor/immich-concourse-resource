@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+"""Concourse `check` script. This is a put-only resource: there is nothing
+to poll (the resource has no versioned upstream to diff against), so this
+is the standard no-op stub Concourse expects put-only resources to provide."""
+import json
+
+
+def main():
+    print(json.dumps([]))
+
+
+if __name__ == "__main__":
+    main()

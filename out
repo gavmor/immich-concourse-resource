@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""Concourse `out` script: uploads matching files as Immich assets, binding
+any matching .xmp sidecar, then resolves/creates the requested album and
+tags and assigns the uploaded assets to them.
+
+API shapes below are verified against a live Immich v3.1.0 instance's
+OpenAPI spec (GET /api/spec.json), not just the AI-research doc this was
+drafted from. See README.md "Known limitations" for the album-creation
+race condition this script cannot fully close.
+"""
+import glob
+import hashlib
+import json
+import os
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+
+import requests
+
+UPLOAD_WORKERS = 4
+
+
+def log(message):
+    print(message, file=sys.stderr)
+
+
+def calculate_checksum(file_path):
+    """SHA-1 of file contents. Used only for dedup/tracking in build
+    metadata -- NOT a cryptographic integrity guarantee, and callers
+    should not treat it as one."""
+    hasher = hashlib.sha1()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def find_xmp_sidecar(file_path):
+    base_path, _ext = os.path.splitext(file_path)
+    for candidate in (f"{base_path}.xmp", f"{file_path}.xmp"):
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def resolve_or_create_album(host, headers, album_identifier):
+    """Resolve an album name to its UUID, creating it if no album with
+    that name exists yet. UUIDs are passed through unchanged.
+
+    Known race: Immich has no unique constraint on albumName and no
+    upsert-by-name endpoint (unlike tags, see resolve_or_create_tags), so
+    this is an unavoidable check-then-create. Two concurrent `out` runs
+    targeting a brand-new album name can both miss the "already exists"
+    check and each create their own album. See README.md for mitigation
+    (serialize jobs that create new albums)."""
+    if len(album_identifier) == 36 and album_identifier.count("-") == 4:
+        return album_identifier
+
+    response = requests.get(f"{host}/api/albums", headers=headers, timeout=30)
+    response.raise_for_status()
+    for album in response.json():
+        if album.get("albumName", "").lower() == album_identifier.lower():
+            log(f"Found existing album '{album_identifier}' with ID: {album['id']}")
+            return album["id"]
+
+    log(f"Album '{album_identifier}' not found. Creating a new album...")
+    response = requests.post(
+        f"{host}/api/albums",
+        headers=headers,
+        json={"albumName": album_identifier},
+        timeout=30,
+    )
+    response.raise_for_status()
+    album_id = response.json()["id"]
+    log(f"Created album '{album_identifier}' with ID: {album_id}")
+    return album_id
+
+
+def resolve_or_create_tags(host, headers, tag_names):
+    """Resolve tag names to UUIDs via Immich's atomic upsert endpoint
+    (PUT /api/tags), which creates-or-updates all given names in a single
+    server-side transaction. This closes the race that a manual
+    get-then-create pattern would have -- unlike albums, Immich has no
+    such upsert for albums."""
+    if not tag_names:
+        return []
+
+    response = requests.put(
+        f"{host}/api/tags", headers=headers, json={"tags": tag_names}, timeout=30
+    )
+    response.raise_for_status()
+    by_name = {tag["name"].lower(): tag["id"] for tag in response.json()}
+    return [by_name[name.lower()] for name in tag_names if name.lower() in by_name]
+
+
+def upload_single_file(args):
+    file_path, upload_url, headers, is_favorite, visibility = args
+    filename = os.path.basename(file_path)
+
+    stat_info = os.stat(file_path)
+    created_at = datetime.fromtimestamp(stat_info.st_ctime, tz=timezone.utc).isoformat()
+    modified_at = datetime.fromtimestamp(stat_info.st_mtime, tz=timezone.utc).isoformat()
+    checksum = calculate_checksum(file_path)
+
+    # NOTE: deliberately no top-level "filename" field in `data`. Immich's
+    # canUploadFile() reuses body.filename (if present) as the extension
+    # source for EVERY multipart field's type check, not just assetData --
+    # so setting it here makes the sidecar's own .xmp extension check run
+    # against the *asset's* filename/extension instead and fail with
+    # "Unsupported file type". Leaving it unset makes Immich fall back to
+    # each part's own filename, which is what we actually want. Verified
+    # against a live v3.1.0 instance: 2026-08-24.
+    data = {
+        "fileCreatedAt": created_at,
+        "fileModifiedAt": modified_at,
+        "isFavorite": "true" if is_favorite else "false",
+        "visibility": visibility,
+    }
+
+    opened_files = []
+    try:
+        img_f = open(file_path, "rb")
+        opened_files.append(img_f)
+        files = {"assetData": (filename, img_f, "application/octet-stream")}
+
+        sidecar_path = find_xmp_sidecar(file_path)
+        if sidecar_path:
+            log(f"Auto-detected XMP sidecar for {filename}: {os.path.basename(sidecar_path)}")
+            sidecar_f = open(sidecar_path, "rb")
+            opened_files.append(sidecar_f)
+            files["sidecarData"] = (os.path.basename(sidecar_path), sidecar_f, "application/xml")
+
+        req_headers = headers.copy()
+        response = requests.post(upload_url, headers=req_headers, data=data, files=files, timeout=120)
+
+        if response.status_code in (200, 201):
+            resp_data = response.json()
+            return {
+                "success": True,
+                "filename": filename,
+                "id": resp_data["id"],
+                "status": resp_data.get("status", "unknown"),
+                "checksum": checksum,
+                "has_sidecar": sidecar_path is not None,
+            }
+        return {
+            "success": False,
+            "filename": filename,
+            "error": f"HTTP {response.status_code}: {response.text}",
+        }
+    except Exception as e:
+        return {"success": False, "filename": filename, "error": str(e)}
+    finally:
+        for f in opened_files:
+            try:
+                f.close()
+            except Exception:
+                pass
+
+
+def main():
+    if len(sys.argv) < 2:
+        log("Error: missing target build directory argument.")
+        sys.exit(1)
+
+    build_dir = sys.argv[1]
+
+    try:
+        input_data = json.load(sys.stdin)
+    except Exception as e:
+        log(f"Error parsing input JSON: {e}")
+        sys.exit(1)
+
+    source = input_data.get("source", {})
+    host = source.get("host")
+    api_key = source.get("api_key")
+    if not host or not api_key:
+        log("Error: both 'host' and 'api_key' must be set in the resource source config.")
+        sys.exit(1)
+    host = host.rstrip("/")
+    headers = {"x-api-key": api_key, "Accept": "application/json"}
+
+    params = input_data.get("params", {})
+    file_glob = params.get("glob")
+    if not file_glob:
+        log("Error: 'glob' must be set in put params.")
+        sys.exit(1)
+    is_favorite = str(params.get("is_favorite", "false")).lower() == "true"
+    visibility = params.get("visibility", "timeline")
+    album_identifier = params.get("album") or params.get("album_id")
+    tags_list = params.get("tags", [])
+
+    search_pattern = os.path.join(build_dir, file_glob)
+    matching_files = [
+        f for f in glob.glob(search_pattern)
+        if os.path.isfile(f) and not f.lower().endswith(".xmp")
+    ]
+
+    if not matching_files:
+        log(f"Warning: no files matched glob pattern: {file_glob}")
+        print(json.dumps({
+            "version": {"ref": datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")},
+            "metadata": [{"name": "uploaded_assets_count", "value": "0"}],
+        }))
+        return
+
+    album_id = resolve_or_create_album(host, headers, album_identifier) if album_identifier else None
+    tag_ids = resolve_or_create_tags(host, headers, tags_list) if tags_list else []
+
+    upload_url = f"{host}/api/assets"
+    log(f"Uploading {len(matching_files)} asset(s) with {UPLOAD_WORKERS} worker(s)...")
+
+    uploaded_asset_ids = []
+    uploaded_assets_meta = []
+    failed_uploads = []
+    sidecars_bound = 0
+    duplicates = 0
+
+    tasks = [(f, upload_url, headers, is_favorite, visibility) for f in matching_files]
+    with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as executor:
+        futures = {executor.submit(upload_single_file, task): task[0] for task in tasks}
+        for future in as_completed(futures):
+            result = future.result()
+            if result["success"]:
+                uploaded_asset_ids.append(result["id"])
+                if result["status"] == "duplicate":
+                    duplicates += 1
+                meta_str = f"{result['filename']} (ID: {result['id']}, SHA-1: {result['checksum'][:8]}, status: {result['status']})"
+                if result["has_sidecar"]:
+                    meta_str += " [XMP bound]"
+                    sidecars_bound += 1
+                uploaded_assets_meta.append(meta_str)
+                log(f"Uploaded {result['filename']} -> {result['id']} ({result['status']})")
+            else:
+                failed_uploads.append((result["filename"], result["error"]))
+                log(f"Error: failed to upload {result['filename']}: {result['error']}")
+
+    if failed_uploads:
+        log(f"Fatal: {len(failed_uploads)} asset upload(s) failed. Aborting build step.")
+        sys.exit(1)
+
+    if album_id and uploaded_asset_ids:
+        log(f"Assigning {len(uploaded_asset_ids)} asset(s) to album '{album_identifier}' ({album_id})")
+        response = requests.put(
+            f"{host}/api/albums/{album_id}/assets",
+            headers=headers,
+            json={"ids": uploaded_asset_ids},
+            timeout=60,
+        )
+        if response.status_code != 200:
+            log(f"Warning: album assignment failed. HTTP {response.status_code}: {response.text}")
+
+    if tag_ids and uploaded_asset_ids:
+        log(f"Assigning {len(uploaded_asset_ids)} asset(s) to {len(tag_ids)} tag(s)")
+        response = requests.put(
+            f"{host}/api/tags/assets",
+            headers=headers,
+            json={"tagIds": tag_ids, "assetIds": uploaded_asset_ids},
+            timeout=60,
+        )
+        if response.status_code != 200:
+            log(f"Warning: tag assignment failed. HTTP {response.status_code}: {response.text}")
+
+    print(json.dumps({
+        "version": {"ref": datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")},
+        "metadata": [
+            {"name": "uploaded_assets_count", "value": str(len(uploaded_asset_ids))},
+            {"name": "duplicate_assets_count", "value": str(duplicates)},
+            {"name": "xmp_sidecars_bound", "value": str(sidecars_bound)},
+            {"name": "assets_meta", "value": ", ".join(uploaded_assets_meta) if uploaded_assets_meta else "none"},
+            {"name": "album_assigned", "value": str(album_identifier) if album_id else "none"},
+            {"name": "tags_assigned", "value": ", ".join(tags_list) if tags_list else "none"},
+        ],
+    }))
+
+
+if __name__ == "__main__":
+    main()
