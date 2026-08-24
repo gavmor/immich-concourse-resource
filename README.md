@@ -70,10 +70,10 @@ jobs:
           glob: "modified-assets/*.png"
           is_favorite: true
           visibility: "timeline"
-          album: "Blades68 Crew Groups"
+          album: "Render Output"
           tags:
-            - "Blades68"
-            - "Concourse Render"
+            - "concourse"
+            - "nightly-render"
 ```
 
 See `concourse/pipeline.example.yml` for the full example.
@@ -106,12 +106,6 @@ During E2E testing, one `PUT /api/tags/assets` call returned `200` with a `count
 Mitigation actually available: **serialize** any pipeline jobs that might create the same new album name concurrently — e.g. use Concourse's `serial: true` on jobs that touch the same not-yet-existing album/tag (or a resource pool/lock, if you need it across multiple jobs) — so the check-then-create only ever runs one at a time for a given album name. This resource type does not attempt a client-side workaround (e.g. picking an arbitrary "canonical" duplicate after the fact) because that only hides the duplicate-row symptom without preventing it, and adds complexity for a case that's fully avoidable operationally. If you already have duplicate same-named albums from before this was understood, merge them manually (move assets, delete the empty one) — there's no API shortcut for that either.
 
 **Soft-delete affects dedup.** `DELETE /api/assets` without `force: true` moves assets to trash rather than deleting them; Immich's checksum-based duplicate detection still matches trashed assets. If you're scripting test cleanup, use scoped `force: true` deletes on the specific asset IDs you created — **not** `POST /api/trash/empty`. That endpoint purges *all* trashed items on the instance, not just yours; on a shared instance this can permanently destroy someone else's soft-deleted assets that hadn't hit their retention window yet (this happened during this repo's own E2E testing — see `test/e2e-test-log.md` Cleanup section for specifics).
-
-## Relationship to `sync_immich_albums.py`
-
-`blades68-lora`'s unmerged `feature/immich-album-sync` branch has `concourse/scripts/sync_immich_albums.py`: a standalone, manually re-run script that mirrors the `blades68-refs` reference library's *existing* folder structure onto Immich albums (one album per folder, recursively, so a nested folder lands in more than one album). It's a batch reconciliation tool for content that already exists in an Immich library — it doesn't upload anything, and it isn't a Concourse resource type.
-
-This resource type solves a different, narrower problem: publishing *new* render output as part of a pipeline run, at the moment it's produced, with an explicit album/tag list rather than folder-derived names, uploading real bytes rather than just re-tagging existing library assets. The two aren't in conflict, and there isn't really a "supersede" relationship in the sense of one making the other obsolete — `sync_immich_albums.py`'s folder-mirroring behavior isn't something this resource type replicates or intends to (it's a fundamentally different indexing approach: folder-derived collections vs. explicit per-`put` album/tag lists). If blades68-lora eventually wires this resource type into `pipeline.yml` for crew-group-portraits-style publishing, the two tools would likely coexist: this resource type for what a pipeline actively renders and pushes going forward, `sync_immich_albums.py` for reconciling anything that lands in the `blades68-refs` library outside of a Concourse run. That integration is out of scope for this repo.
 
 ## CI
 

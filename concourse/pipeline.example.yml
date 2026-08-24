@@ -46,7 +46,7 @@ jobs:
           glob: "modified-assets/*.png"
           is_favorite: true
           visibility: "timeline"
-          album: "Blades68 Crew Groups"
+          album: "Render Output"
           tags:
-            - "Blades68"
-            - "Concourse Render"
+            - "concourse"
+            - "nightly-render"
