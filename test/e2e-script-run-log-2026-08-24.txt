@@ -1,0 +1,24 @@
+--- running out ---
+Album 'immich-concourse-resource-test-e2e-05c4294b' not found. Creating a new album...
+Created album 'immich-concourse-resource-test-e2e-05c4294b' with ID: b3f03d23-573f-4999-b288-78e16a14441a
+Uploading 2 asset(s) with 4 worker(s)...
+Auto-detected XMP sidecar for e2e-05c4294b-1.png: e2e-05c4294b-1.png.xmp
+Uploaded e2e-05c4294b-2.png -> 4b880914-70e9-4184-9123-0c90f615c304 (created)
+Uploaded e2e-05c4294b-1.png -> b7bf1994-a187-49e0-9612-4eda7660ade6 (created)
+Assigning 2 asset(s) to album 'immich-concourse-resource-test-e2e-05c4294b' (b3f03d23-573f-4999-b288-78e16a14441a)
+Assigning 2 asset(s) to 2 tag(s)
+{"version": {"ref": "20260824202142"}, "metadata": [{"name": "uploaded_assets_count", "value": "2"}, {"name": "duplicate_assets_count", "value": "0"}, {"name": "xmp_sidecars_bound", "value": "1"}, {"name": "assets_meta", "value": "e2e-05c4294b-2.png (ID: 4b880914-70e9-4184-9123-0c90f615c304, SHA-1: 472125f3, status: created), e2e-05c4294b-1.png (ID: b7bf1994-a187-49e0-9612-4eda7660ade6, SHA-1: 76657fed, status: created) [XMP bound]"}, {"name": "album_assigned", "value": "immich-concourse-resource-test-e2e-05c4294b"}, {"name": "tags_assigned", "value": "e2e-tag-a-e2e-05c4294b, e2e-tag-b-e2e-05c4294b"}]}
+
+--- verifying against live API ---
+PASS: album created, 2 assets uploaded, XMP sidecar bound, both tags assigned
+ALBUM_ID=b3f03d23-573f-4999-b288-78e16a14441a
+ASSET_ID=b7bf1994-a187-49e0-9612-4eda7660ade6
+ASSET_ID=4b880914-70e9-4184-9123-0c90f615c304
+--- cleaning up test data created by this run ---
+album delete: 204
+asset b7bf1994-a187-49e0-9612-4eda7660ade6 delete: 204
+asset 4b880914-70e9-4184-9123-0c90f615c304 delete: 204
+tag e2e-tag-a-e2e-05c4294b delete: 204
+tag e2e-tag-b-e2e-05c4294b delete: 204
+--- e2e test complete ---
+exit=0

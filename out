@@ -250,6 +250,13 @@ def main():
         )
         if response.status_code != 200:
             log(f"Warning: album assignment failed. HTTP {response.status_code}: {response.text}")
+        else:
+            # Response is an array of per-asset {id, success, error} results
+            # (BulkIdResponseDto) -- a 200 overall can still contain individual
+            # failures, so check each rather than trusting the status code alone.
+            for item in response.json():
+                if isinstance(item, dict) and not item.get("success", True):
+                    log(f"Warning: album assignment failed for asset {item.get('id')}: {item.get('error')}")
 
     if tag_ids and uploaded_asset_ids:
         log(f"Assigning {len(uploaded_asset_ids)} asset(s) to {len(tag_ids)} tag(s)")
@@ -261,6 +268,17 @@ def main():
         )
         if response.status_code != 200:
             log(f"Warning: tag assignment failed. HTTP {response.status_code}: {response.text}")
+        else:
+            # Response is {"count": N} (TagBulkAssetsResponseDto) -- the
+            # number of asset-tag associations actually made, which should
+            # equal len(tag_ids) * len(uploaded_asset_ids). Observed empirically
+            # (2026-08-24) that this can come back short under concurrent write
+            # load against the same instance without a non-200 status, so a
+            # short count is worth surfacing even though we don't retry here.
+            expected = len(tag_ids) * len(uploaded_asset_ids)
+            actual = response.json().get("count", 0)
+            if actual < expected:
+                log(f"Warning: tag assignment made {actual}/{expected} associations; some assets may be missing tags.")
 
     print(json.dumps({
         "version": {"ref": datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")},
