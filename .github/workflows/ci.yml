@@ -1,0 +1,143 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+
+jobs:
+  # PRs only: prove the Dockerfile still builds. Never pushes an image.
+  build-validate:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: ${{ env.IMAGE_NAME }}:pr-validate
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Live smoke test: exercises the actual check/in/out scripts against a
+  # real, freshly-provisioned Immich instance (official release compose),
+  # not just a Dockerfile build. This is what catches API drift in a
+  # future Immich release before it breaks a real pipeline. Runs on every
+  # push to main and on demand -- deliberately NOT on every PR, since
+  # standing up Postgres+Redis+Immich server/ML per-PR is slower than the
+  # signal is worth for a resource type this size; PRs get the fast
+  # build-validate job instead. See README "CI" section.
+  e2e:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stand up a real Immich instance
+        run: |
+          curl -fsSL -o docker-compose.yml \
+            https://github.com/immich-app/immich/releases/latest/download/docker-compose.yml
+          curl -fsSL -o .env \
+            https://github.com/immich-app/immich/releases/latest/download/example.env
+          {
+            echo "UPLOAD_LOCATION=./library"
+            echo "DB_DATA_LOCATION=./postgres"
+            echo "DB_PASSWORD=$(openssl rand -hex 16)"
+          } >> .env
+          docker compose up -d
+
+      - name: Wait for Immich to become reachable
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:2283/api/server/ping >/dev/null 2>&1; then
+              echo "Immich is up after ${i}0s"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Immich never became reachable" >&2
+          docker compose logs
+          exit 1
+
+      - name: Bootstrap admin account and API key
+        run: |
+          set -euo pipefail
+          curl -fsS -X POST http://localhost:2283/api/auth/admin-sign-up \
+            -H 'Content-Type: application/json' \
+            -d '{"email":"ci@example.invalid","name":"CI","password":"ci-test-password-1"}' \
+            >/dev/null
+
+          ACCESS_TOKEN=$(curl -fsS -X POST http://localhost:2283/api/auth/login \
+            -H 'Content-Type: application/json' \
+            -d '{"email":"ci@example.invalid","password":"ci-test-password-1"}' \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["accessToken"])')
+
+          API_KEY=$(curl -fsS -X POST http://localhost:2283/api/api-keys \
+            -H 'Content-Type: application/json' \
+            -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+            -d '{"name":"ci","permissions":["all"]}' \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["secret"])')
+
+          echo "::add-mask::${API_KEY}"
+          echo "IMMICH_API_KEY=${API_KEY}" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install requests==2.34.2 Pillow
+
+      - name: Run end-to-end test against the live instance
+        env:
+          IMMICH_HOST: http://localhost:2283
+        run: ./test/run_e2e_test.sh
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  publish:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=edge-,format=short,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

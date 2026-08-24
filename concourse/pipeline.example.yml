@@ -3,7 +3,10 @@ resource_types:
     type: registry-image
     source:
       repository: ghcr.io/gavmor/immich-concourse-resource
-      tag: latest
+      # Pin to a released version tag (e.g. "1.2.0", published by CI on
+      # every `vX.Y.Z` git tag -- see README.md "CI"), not `latest`,
+      # so a new release can't silently change pipeline behavior.
+      tag: ((immich_resource_version))
 
 resources:
   - name: git-repo

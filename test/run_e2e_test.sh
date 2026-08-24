@@ -91,23 +91,33 @@ assert len(album_assets) == 2, f"expected 2 assets via search, got {len(album_as
 
 sidecar_asset = next(a for a in album_assets if a["originalFileName"].endswith("-1.png"))
 
-# Tag assignment can lag a read-your-write GET by a couple of seconds even
-# after PUT /api/tags/assets returns 200 with the expected count -- observed
-# independently twice during this repo's own E2E testing (see
-# test/e2e-test-log.md). Poll briefly rather than treat that as a failure.
+# Both of these lag a read-your-write GET, independently of each other and
+# of the synchronous upload response:
+#  - tag assignment can lag by a couple of seconds even after
+#    PUT /api/tags/assets returns 200 with the expected count (observed
+#    independently twice during this repo's own E2E testing, see
+#    test/e2e-test-log.md)
+#  - the XMP sidecar's dc:description only appears once Immich's async
+#    metadata-extraction job has run, which on a freshly-provisioned
+#    instance (e.g. in CI, right after admin bootstrap) can take longer
+#    than a couple of seconds since nothing has warmed up the job queue
+#    yet (observed taking 5-10x longer than the steady-state case seen in
+#    the original debugging session -- see test/e2e-test-log.md)
+# Poll both together rather than treat either lag as a failure.
 expected_tags = {f"e2e-tag-a-{run_id}", f"e2e-tag-b-{run_id}"}
 detail = None
-for attempt in range(5):
+for attempt in range(20):
     detail = get(f"/api/assets/{sidecar_asset['id']}")
     tag_names = {t["name"] for t in detail.get("tags", [])}
-    if expected_tags <= tag_names:
+    desc = (detail.get("exifInfo") or {}).get("description") or ""
+    if expected_tags <= tag_names and run_id in desc:
         break
     time.sleep(1)
 else:
-    raise AssertionError(f"tags missing after retries, got: {tag_names}")
-
-desc = (detail.get("exifInfo") or {}).get("description") or ""
-assert run_id in desc, f"sidecar description not bound, got: {desc!r}"
+    raise AssertionError(
+        f"tags and/or sidecar description missing after retries, "
+        f"got tags={tag_names}, description={desc!r}"
+    )
 
 print("PASS: album created, 2 assets uploaded, XMP sidecar bound, both tags assigned")
 print(f"ALBUM_ID={matches[0]['id']}")

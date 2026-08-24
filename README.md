@@ -73,8 +73,8 @@ resource_types:
   - name: immich-api
     type: registry-image
     source:
-      repository: blades68-registry/immich-resource
-      tag: latest
+      repository: ghcr.io/gavmor/immich-concourse-resource
+      tag: ((immich_resource_version)) # e.g. "1.0.0" -- see "CI" below
 
 resources:
   - name: local-immich-gallery
@@ -102,6 +102,24 @@ jobs:
 ```
 
 See `concourse/pipeline.example.yml` for the full example.
+
+## CI
+
+`.github/workflows/ci.yml` builds and publishes the resource image to `ghcr.io/gavmor/immich-concourse-resource`:
+
+| Trigger | Job | What happens |
+|---|---|---|
+| Pull request | `build-validate` | Builds the Dockerfile (no push). Catches a broken image before merge. |
+| Push to `main` | `publish` | Builds and pushes `:latest` and `:edge-<short-sha>`. |
+| Push to `main` | `e2e` | Stands up a real Immich instance (the project's own official release `docker-compose.yml`), bootstraps an admin account and API key via the live API, and runs `test/run_e2e_test.sh` against it. |
+| Push of a `vX.Y.Z` tag | `publish` | Builds and pushes semver tags: `X.Y.Z`, `X.Y`, `X`. |
+| Manual (`workflow_dispatch`) | `e2e` | Same live smoke test, on demand. |
+
+Pin pipelines to a semver tag (`X.Y.Z`), not `:latest` — that's what `((immich_resource_version))` is for in `concourse/pipeline.example.yml`.
+
+**Why `e2e` doesn't run on every PR:** standing up Postgres + Redis + the Immich server/ML services is real time and real image-pull weight per run, and this is a small `put`-only resource where a broken Dockerfile (caught by `build-validate`) is the far more common failure mode. `e2e` instead runs post-merge on `main` as a continuous canary against whatever Immich currently ships as its latest release — so if a future Immich release changes one of the API shapes documented above (an upsert response shape, a required upload field, etc.), this surfaces as a red job on `main` rather than as a silent break discovered in production. It is intentionally not wired as a required check on `publish`: a canary catching upstream API drift shouldn't block cutting a release of code that hasn't changed.
+
+**One-time manual step:** the first successful `publish` run creates the GHCR package but it defaults to private. Go to the package's settings on GitHub (`gavmor/immich-concourse-resource` → Packages) and set visibility to public / link it to the repo, or `docker pull` will 401 for anyone without registry auth. GITHUB_TOKEN can't do this itself — GHCR's visibility inheritance from a public repo only applies to packages created via the repo's own "Packages" UI flow, not the first API/registry push.
 
 ## Building
 
