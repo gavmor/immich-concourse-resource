@@ -15,15 +15,40 @@ import json
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import ExitStack
 from datetime import datetime, timezone
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 
 UPLOAD_WORKERS = 4
 
 
 def log(message):
     print(message, file=sys.stderr)
+
+
+def create_session(api_key, pool_size=UPLOAD_WORKERS):
+    session = requests.Session()
+    session.headers.update({
+        "x-api-key": api_key,
+        "Accept": "application/json",
+    })
+    retries = Retry(
+        total=4,
+        backoff_factor=0.5,
+        status_forcelist=[502, 503, 504],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(
+        pool_connections=pool_size,
+        pool_maxsize=pool_size,
+        max_retries=retries,
+    )
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
 
 
 def calculate_checksum(file_path):
@@ -63,7 +88,7 @@ def find_description_sidecar(file_path):
     return None
 
 
-def resolve_or_create_album(host, headers, album_identifier):
+def resolve_or_create_album(session, host, album_identifier):
     """Resolve an album name to its UUID, creating it if no album with
     that name exists yet. UUIDs are passed through unchanged.
 
@@ -76,7 +101,7 @@ def resolve_or_create_album(host, headers, album_identifier):
     if len(album_identifier) == 36 and album_identifier.count("-") == 4:
         return album_identifier
 
-    response = requests.get(f"{host}/api/albums", headers=headers, timeout=30)
+    response = session.get(f"{host}/api/albums", timeout=30)
     response.raise_for_status()
     for album in response.json():
         if album.get("albumName", "").lower() == album_identifier.lower():
@@ -84,9 +109,8 @@ def resolve_or_create_album(host, headers, album_identifier):
             return album["id"]
 
     log(f"Album '{album_identifier}' not found. Creating a new album...")
-    response = requests.post(
+    response = session.post(
         f"{host}/api/albums",
-        headers=headers,
         json={"albumName": album_identifier},
         timeout=30,
     )
@@ -96,7 +120,7 @@ def resolve_or_create_album(host, headers, album_identifier):
     return album_id
 
 
-def resolve_or_create_tags(host, headers, tag_names):
+def resolve_or_create_tags(session, host, tag_names):
     """Resolve tag names to UUIDs via Immich's atomic upsert endpoint
     (PUT /api/tags), which creates-or-updates all given names in a single
     server-side transaction. This closes the race that a manual
@@ -105,15 +129,15 @@ def resolve_or_create_tags(host, headers, tag_names):
     if not tag_names:
         return []
 
-    response = requests.put(
-        f"{host}/api/tags", headers=headers, json={"tags": tag_names}, timeout=30
+    response = session.put(
+        f"{host}/api/tags", json={"tags": tag_names}, timeout=30
     )
     response.raise_for_status()
     by_name = {tag["name"].lower(): tag["id"] for tag in response.json()}
     return [by_name[name.lower()] for name in tag_names if name.lower() in by_name]
 
 
-def set_description(host, headers, asset_id, description):
+def set_description(session, host, asset_id, description):
     """PUT /api/assets/{id} {"description": ...} -- confirmed against a live
     Immich v3.1.0 instance's own OpenAPI spec (AssetBulkUpdateDto's
     per-asset counterpart) and already exercised by a real caller: the
@@ -122,9 +146,8 @@ def set_description(host, headers, asset_id, description):
     caller logs and moves on rather than failing the whole upload over a
     description that didn't stick, matching this script's existing
     warn-not-abort handling of the album/tag bulk-assignment endpoints."""
-    response = requests.put(
+    response = session.put(
         f"{host}/api/assets/{asset_id}",
-        headers=headers,
         json={"description": description},
         timeout=30,
     )
@@ -132,7 +155,7 @@ def set_description(host, headers, asset_id, description):
 
 
 def upload_single_file(args):
-    file_path, host, upload_url, headers, is_favorite, visibility = args
+    file_path, host, upload_url, session, is_favorite, visibility = args
     filename = os.path.basename(file_path)
 
     stat_info = os.stat(file_path)
@@ -155,60 +178,52 @@ def upload_single_file(args):
         "visibility": visibility,
     }
 
-    opened_files = []
     try:
-        img_f = open(file_path, "rb")
-        opened_files.append(img_f)
-        files = {"assetData": (filename, img_f, "application/octet-stream")}
+        with ExitStack() as stack:
+            img_f = stack.enter_context(open(file_path, "rb"))
+            files = {"assetData": (filename, img_f, "application/octet-stream")}
 
-        sidecar_path = find_xmp_sidecar(file_path)
-        if sidecar_path:
-            log(f"Auto-detected XMP sidecar for {filename}: {os.path.basename(sidecar_path)}")
-            sidecar_f = open(sidecar_path, "rb")
-            opened_files.append(sidecar_f)
-            files["sidecarData"] = (os.path.basename(sidecar_path), sidecar_f, "application/xml")
+            sidecar_path = find_xmp_sidecar(file_path)
+            if sidecar_path:
+                log(f"Auto-detected XMP sidecar for {filename}: {os.path.basename(sidecar_path)}")
+                sidecar_f = stack.enter_context(open(sidecar_path, "rb"))
+                files["sidecarData"] = (os.path.basename(sidecar_path), sidecar_f, "application/xml")
 
-        req_headers = headers.copy()
-        response = requests.post(upload_url, headers=req_headers, data=data, files=files, timeout=120)
+            response = session.post(upload_url, data=data, files=files, timeout=120)
 
-        if response.status_code in (200, 201):
-            resp_data = response.json()
-            asset_id = resp_data["id"]
+            if response.status_code in (200, 201):
+                resp_data = response.json()
+                asset_id = resp_data["id"]
 
-            description_bound = False
-            description_path = find_description_sidecar(file_path)
-            if description_path:
-                with open(description_path, "r", encoding="utf-8") as desc_f:
-                    description_text = desc_f.read().strip()
-                if description_text:
-                    log(f"Auto-detected description sidecar for {filename}: {os.path.basename(description_path)}")
-                    if set_description(host, headers, asset_id, description_text):
-                        description_bound = True
-                    else:
-                        log(f"Warning: description sidecar found for {filename} but PUT /api/assets/{asset_id} failed -- upload itself still succeeded")
+                description_bound = False
+                description_path = find_description_sidecar(file_path)
+                if description_path:
+                    with open(description_path, "r", encoding="utf-8") as desc_f:
+                        description_text = desc_f.read().strip()
+                    if description_text:
+                        log(f"Auto-detected description sidecar for {filename}: {os.path.basename(description_path)}")
+                        if set_description(session, host, asset_id, description_text):
+                            description_bound = True
+                        else:
+                            log(f"Warning: description sidecar found for {filename} but PUT /api/assets/{asset_id} failed -- upload itself still succeeded")
+
+                return {
+                    "success": True,
+                    "filename": filename,
+                    "id": asset_id,
+                    "status": resp_data.get("status", "unknown"),
+                    "checksum": checksum,
+                    "has_sidecar": sidecar_path is not None,
+                    "has_description": description_bound,
+                }
 
             return {
-                "success": True,
+                "success": False,
                 "filename": filename,
-                "id": asset_id,
-                "status": resp_data.get("status", "unknown"),
-                "checksum": checksum,
-                "has_sidecar": sidecar_path is not None,
-                "has_description": description_bound,
+                "error": f"HTTP {response.status_code}: {response.text}",
             }
-        return {
-            "success": False,
-            "filename": filename,
-            "error": f"HTTP {response.status_code}: {response.text}",
-        }
     except Exception as e:
         return {"success": False, "filename": filename, "error": str(e)}
-    finally:
-        for f in opened_files:
-            try:
-                f.close()
-            except Exception:
-                pass
 
 
 def main():
@@ -231,7 +246,6 @@ def main():
         log("Error: both 'host' and 'api_key' must be set in the resource source config.")
         sys.exit(1)
     host = host.rstrip("/")
-    headers = {"x-api-key": api_key, "Accept": "application/json"}
 
     params = input_data.get("params", {})
     file_glob = params.get("glob")
@@ -259,50 +273,48 @@ def main():
         }))
         return
 
-    album_id = resolve_or_create_album(host, headers, album_identifier) if album_identifier else None
-    tag_ids = resolve_or_create_tags(host, headers, tags_list) if tags_list else []
+    session = create_session(api_key)
+    album_id = resolve_or_create_album(session, host, album_identifier) if album_identifier else None
+    tag_ids = resolve_or_create_tags(session, host, tags_list) if tags_list else []
 
     upload_url = f"{host}/api/assets"
     log(f"Uploading {len(matching_files)} asset(s) with {UPLOAD_WORKERS} worker(s)...")
 
-    uploaded_asset_ids = []
-    uploaded_assets_meta = []
+    uploaded_assets = []
     failed_uploads = []
+    duplicates = 0
     sidecars_bound = 0
     descriptions_bound = 0
-    duplicates = 0
 
-    tasks = [(f, host, upload_url, headers, is_favorite, visibility) for f in matching_files]
+    tasks = [(f, host, upload_url, session, is_favorite, visibility) for f in matching_files]
     with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as executor:
         futures = {executor.submit(upload_single_file, task): task[0] for task in tasks}
         for future in as_completed(futures):
-            result = future.result()
-            if result["success"]:
-                uploaded_asset_ids.append(result["id"])
-                if result["status"] == "duplicate":
+            res = future.result()
+            if res["success"]:
+                uploaded_assets.append(res)
+                if res["status"] == "duplicate":
                     duplicates += 1
-                meta_str = f"{result['filename']} (ID: {result['id']}, SHA-1: {result['checksum'][:8]}, status: {result['status']})"
-                if result["has_sidecar"]:
-                    meta_str += " [XMP bound]"
+                if res["has_sidecar"]:
                     sidecars_bound += 1
-                if result["has_description"]:
-                    meta_str += " [description bound]"
+                if res["has_description"]:
                     descriptions_bound += 1
-                uploaded_assets_meta.append(meta_str)
-                log(f"Uploaded {result['filename']} -> {result['id']} ({result['status']})")
+                log(f"Uploaded {res['filename']} -> {res['id']} ({res['status']})")
             else:
-                failed_uploads.append((result["filename"], result["error"]))
-                log(f"Error: failed to upload {result['filename']}: {result['error']}")
+                failed_uploads.append(res)
+                log(f"Error: failed to upload {res['filename']}: {res['error']}")
 
     if failed_uploads:
-        log(f"Fatal: {len(failed_uploads)} asset upload(s) failed. Aborting build step.")
+        failed_names = ", ".join([f["filename"] for f in failed_uploads])
+        log(f"Fatal: {len(failed_uploads)} asset upload(s) failed for [{failed_names}]. Aborting build step.")
         sys.exit(1)
+
+    uploaded_asset_ids = [a["id"] for a in uploaded_assets]
 
     if album_id and uploaded_asset_ids:
         log(f"Assigning {len(uploaded_asset_ids)} asset(s) to album '{album_identifier}' ({album_id})")
-        response = requests.put(
+        response = session.put(
             f"{host}/api/albums/{album_id}/assets",
-            headers=headers,
             json={"ids": uploaded_asset_ids},
             timeout=60,
         )
@@ -318,9 +330,8 @@ def main():
 
     if tag_ids and uploaded_asset_ids:
         log(f"Assigning {len(uploaded_asset_ids)} asset(s) to {len(tag_ids)} tag(s)")
-        response = requests.put(
+        response = session.put(
             f"{host}/api/tags/assets",
-            headers=headers,
             json={"tagIds": tag_ids, "assetIds": uploaded_asset_ids},
             timeout=60,
         )
@@ -329,14 +340,18 @@ def main():
         else:
             # Response is {"count": N} (TagBulkAssetsResponseDto) -- the
             # number of asset-tag associations actually made, which should
-            # equal len(tag_ids) * len(uploaded_asset_ids). Observed empirically
-            # (2026-08-24) that this can come back short under concurrent write
-            # load against the same instance without a non-200 status, so a
-            # short count is worth surfacing even though we don't retry here.
+            # equal len(tag_ids) * len(uploaded_asset_ids).
             expected = len(tag_ids) * len(uploaded_asset_ids)
             actual = response.json().get("count", 0)
             if actual < expected:
                 log(f"Warning: tag assignment made {actual}/{expected} associations; some assets may be missing tags.")
+
+    uploaded_assets_meta = [
+        f"{a['filename']} (ID: {a['id']}, SHA-1: {a['checksum'][:8]}, status: {a['status']})"
+        + (" [XMP bound]" if a["has_sidecar"] else "")
+        + (" [description bound]" if a["has_description"] else "")
+        for a in uploaded_assets
+    ]
 
     print(json.dumps({
         "version": {"ref": datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")},
