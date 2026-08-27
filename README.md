@@ -1,6 +1,6 @@
 # immich-concourse-resource
 
-A custom [Concourse](https://concourse-ci.org/) resource type for pushing build-directory assets into [Immich](https://immich.app/) via its REST API: `put`-only, with optional album and tag auto-provisioning and XMP sidecar binding.
+A custom [Concourse](https://concourse-ci.org/) resource type for pushing build-directory assets into [Immich](https://immich.app/) via its REST API: `put`-only, with optional album and tag auto-provisioning, XMP sidecar binding, and plain-text description binding.
 
 This is a `put`-only resource — there is no upstream version to poll, so `check` and `get` are no-op stubs. All the real behavior is in `out`.
 
@@ -23,11 +23,19 @@ Does not fetch anything. Echoes back whatever `version` was given to it (the ref
 
 ### `out`: upload assets, bind sidecars, assign album/tags
 
-1. Globs files in the build directory matching `params.glob` (skipping any `.xmp` files themselves).
+1. Globs files in the build directory matching `params.glob` (skipping any `.xmp` or `.description.txt` files themselves).
 2. For each matching file: computes a SHA-1 content hash (for dedup/tracking in build metadata — not a cryptographic integrity claim, just what Immich itself uses for its own duplicate detection), looks for a matching `.xmp` sidecar (`<name>.xmp` or `<name.ext>.xmp`) and binds it if found.
 3. Uploads all matches concurrently (`ThreadPoolExecutor`, 4 workers) via multipart `POST /api/assets`.
-4. Resolves or auto-creates the requested album (by name) and tags (by name).
-5. Bulk-assigns the uploaded assets to that album and those tags.
+4. For each successful upload, looks for a matching `.description.txt` sidecar (`<name>.description.txt` or `<name.ext>.description.txt`, same two-candidate lookup as the XMP sidecar above) and, if found and non-empty, sets it as the asset's description via a direct `PUT /api/assets/{id}`.
+5. Resolves or auto-creates the requested album (by name) and tags (by name).
+6. Bulk-assigns the uploaded assets to that album and those tags.
+
+#### Two ways to set a description: XMP sidecar vs. `.description.txt`
+
+Both are supported and independent — a single asset can carry an XMP sidecar (for whatever other embedded XMP a caller cares about) and a separate `.description.txt` for just the description field, or either alone.
+
+- **XMP sidecar**: the description lives inside `dc:description`, which Immich extracts asynchronously via its own metadata-extraction job after upload — a caller polling immediately after `out` finishes may not see it yet (see the async-lag note in "Verified API shapes" below, and `test/e2e-test-log.md`).
+- **`.description.txt`**: a plain UTF-8 text file, no XML envelope, no escaping needed on the caller's side. `out` reads it and calls `PUT /api/assets/{id}` directly, synchronously, before that upload's own result is reported — the description is already set by the time `out` exits. Use this one unless you specifically need other XMP fields too; it's the simpler path for the common "just attach a caption/prompt/description" case.
 
 If any individual upload fails, the step fails after attempting all uploads (it doesn't abort early on the first failure).
 
@@ -40,6 +48,8 @@ If any individual upload fails, the step fails after attempting all uploads (it 
 | `visibility` *(Optional, default `timeline`)* | One of `archive`, `timeline`, `hidden`, `locked`. |
 | `album` *(Optional)* | Album name (or an existing album's UUID) to assign uploaded assets to. Created if no album with that name exists yet — see the album-creation race caveat below. |
 | `tags` *(Optional)* | List of tag names to assign to uploaded assets. Created via an atomic upsert if they don't already exist. |
+
+There's no `description` param here — descriptions are per-asset (one `put` can upload many files, each with its own text), so they're supplied the same way XMP sidecars already are: drop a `<name>.description.txt` (or `<name.ext>.description.txt`) next to the file being uploaded and `out` picks it up automatically. See "Two ways to set a description" above.
 
 ## Example
 
@@ -85,6 +95,7 @@ Everything below was checked against a **live Immich v3.1.0 instance's own OpenA
 | Area | Verified shape |
 |---|---|
 | Upload | `POST /api/assets`, multipart. Required: `fileCreatedAt`, `fileModifiedAt`, `assetData`. Optional: `filename`, `isFavorite`, `visibility`, `sidecarData`. Response: `{"status": "created"\|"duplicate", "id": "<uuid>"}` — `201` for a new asset, `200` if Immich recognized it as a duplicate by content hash and just returned the existing asset's ID. |
+| Description update | `PUT /api/assets/{id}` `{"description": "..."}` (`UpdateAssetDto.description: string`, per `/assets/{id}`'s own request schema in `spec.json`) → `200`. Synchronous — unlike an XMP sidecar's `dc:description`, which only shows up once Immich's async metadata-extraction job has run, this field is set and readable immediately. |
 | `visibility` enum | `archive`, `timeline`, `hidden`, `locked`. |
 | Album create | `POST /api/albums` `{"albumName": "..."}` → `201` with the full album object. |
 | Album list | `GET /api/albums` → array of albums, matched by `albumName` (case-insensitive here). |

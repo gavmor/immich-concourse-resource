@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # End-to-end smoke test: uploads two generated PNGs (one with an XMP
-# sidecar) through the `out` script against a real running Immich
-# instance, verifies album/tag/sidecar binding via the API, then deletes
+# sidecar, the other with a .description.txt sidecar) through the `out`
+# script against a real running Immich instance, verifies
+# album/tag/sidecar/description binding via the API, then deletes
 # everything it created.
 #
 # Usage: IMMICH_HOST=http://localhost:2283 IMMICH_API_KEY=... ./run_e2e_test.sh
@@ -41,6 +42,13 @@ cat > "${RUN_ID}-1.png.xmp" <<XMPEOF
 </x:xmpmeta>
 <?xpacket end="w"?>
 XMPEOF
+
+# .description.txt sidecar on the second file -- plain text, no XML
+# envelope, exercising the direct PUT /api/assets/{id} path rather than
+# XMP's async-extraction one. Deliberately includes a character (&) that
+# would need escaping if this went through the XMP path, to prove this
+# path really doesn't need it.
+printf '%s' "${RUN_ID} plain-text description sidecar, with an & in it" > "${RUN_ID}-2.png.description.txt"
 
 cd "$WORKDIR"
 cat > out-input.json <<JSONEOF
@@ -90,6 +98,8 @@ album_assets = post("/api/search/metadata", {"albumIds": [matches[0]["id"]]})["a
 assert len(album_assets) == 2, f"expected 2 assets via search, got {len(album_assets)}"
 
 sidecar_asset = next(a for a in album_assets if a["originalFileName"].endswith("-1.png"))
+description_asset = next(a for a in album_assets if a["originalFileName"].endswith("-2.png"))
+expected_plain_description = f"{run_id} plain-text description sidecar, with an & in it"
 
 # Both of these lag a read-your-write GET, independently of each other and
 # of the synchronous upload response:
@@ -103,7 +113,11 @@ sidecar_asset = next(a for a in album_assets if a["originalFileName"].endswith("
 #    than a couple of seconds since nothing has warmed up the job queue
 #    yet (observed taking 5-10x longer than the steady-state case seen in
 #    the original debugging session -- see test/e2e-test-log.md)
-# Poll both together rather than treat either lag as a failure.
+# Poll both together rather than treat either lag as a failure. The
+# .description.txt path (set_description in `out`) is a direct
+# PUT /api/assets/{id} the `out` script already waited on synchronously
+# before this script ever ran -- checked once below, no retry loop needed,
+# specifically to prove it doesn't share the XMP path's async lag.
 expected_tags = {f"e2e-tag-a-{run_id}", f"e2e-tag-b-{run_id}"}
 detail = None
 for attempt in range(20):
@@ -119,7 +133,13 @@ else:
         f"got tags={tag_names}, description={desc!r}"
     )
 
-print("PASS: album created, 2 assets uploaded, XMP sidecar bound, both tags assigned")
+plain_detail = get(f"/api/assets/{description_asset['id']}")
+plain_desc = (plain_detail.get("exifInfo") or {}).get("description") or ""
+assert plain_desc == expected_plain_description, (
+    f"expected plain-text sidecar description {expected_plain_description!r}, got {plain_desc!r}"
+)
+
+print("PASS: album created, 2 assets uploaded, XMP sidecar bound, .description.txt sidecar bound, both tags assigned")
 print(f"ALBUM_ID={matches[0]['id']}")
 for a in album_assets:
     print(f"ASSET_ID={a['id']}")
