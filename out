@@ -101,7 +101,7 @@ def resolve_or_create_album(session, host, album_identifier):
     if len(album_identifier) == 36 and album_identifier.count("-") == 4:
         return album_identifier
 
-    response = session.get(f"{host}/api/albums", timeout=30)
+    response = session.get(f"{host}/api/albums", timeout=(10, 30))
     response.raise_for_status()
     for album in response.json():
         if album.get("albumName", "").lower() == album_identifier.lower():
@@ -112,7 +112,7 @@ def resolve_or_create_album(session, host, album_identifier):
     response = session.post(
         f"{host}/api/albums",
         json={"albumName": album_identifier},
-        timeout=30,
+        timeout=(10, 30),
     )
     response.raise_for_status()
     album_id = response.json()["id"]
@@ -130,7 +130,7 @@ def resolve_or_create_tags(session, host, tag_names):
         return []
 
     response = session.put(
-        f"{host}/api/tags", json={"tags": tag_names}, timeout=30
+        f"{host}/api/tags", json={"tags": tag_names}, timeout=(10, 30)
     )
     response.raise_for_status()
     by_name = {tag["name"].lower(): tag["id"] for tag in response.json()}
@@ -149,7 +149,7 @@ def set_description(session, host, asset_id, description):
     response = session.put(
         f"{host}/api/assets/{asset_id}",
         json={"description": description},
-        timeout=30,
+        timeout=(10, 30),
     )
     return response.status_code == 200
 
@@ -178,52 +178,59 @@ def upload_single_file(args):
         "visibility": visibility,
     }
 
+    sidecar_path = find_xmp_sidecar(file_path)
+
+    # Stage 1: Upload media under active, strict file descriptor management
     try:
         with ExitStack() as stack:
             img_f = stack.enter_context(open(file_path, "rb"))
             files = {"assetData": (filename, img_f, "application/octet-stream")}
 
-            sidecar_path = find_xmp_sidecar(file_path)
             if sidecar_path:
                 log(f"Auto-detected XMP sidecar for {filename}: {os.path.basename(sidecar_path)}")
                 sidecar_f = stack.enter_context(open(sidecar_path, "rb"))
                 files["sidecarData"] = (os.path.basename(sidecar_path), sidecar_f, "application/xml")
 
-            response = session.post(upload_url, data=data, files=files, timeout=120)
+            response = session.post(upload_url, data=data, files=files, timeout=(10, 120))
 
-            if response.status_code in (200, 201):
-                resp_data = response.json()
-                asset_id = resp_data["id"]
-
-                description_bound = False
-                description_path = find_description_sidecar(file_path)
-                if description_path:
-                    with open(description_path, "r", encoding="utf-8") as desc_f:
-                        description_text = desc_f.read().strip()
-                    if description_text:
-                        log(f"Auto-detected description sidecar for {filename}: {os.path.basename(description_path)}")
-                        if set_description(session, host, asset_id, description_text):
-                            description_bound = True
-                        else:
-                            log(f"Warning: description sidecar found for {filename} but PUT /api/assets/{asset_id} failed -- upload itself still succeeded")
-
+            if response.status_code not in (200, 201):
                 return {
-                    "success": True,
+                    "success": False,
                     "filename": filename,
-                    "id": asset_id,
-                    "status": resp_data.get("status", "unknown"),
-                    "checksum": checksum,
-                    "has_sidecar": sidecar_path is not None,
-                    "has_description": description_bound,
+                    "error": f"HTTP {response.status_code}: {response.text}",
                 }
 
-            return {
-                "success": False,
-                "filename": filename,
-                "error": f"HTTP {response.status_code}: {response.text}",
-            }
+            resp_data = response.json()
+            asset_id = resp_data["id"]
+            status = resp_data.get("status", "unknown")
     except Exception as e:
         return {"success": False, "filename": filename, "error": str(e)}
+
+    # Stage 2: Bind description safely OUTSIDE the local file-stream context
+    description_bound = False
+    description_path = find_description_sidecar(file_path)
+    if description_path:
+        try:
+            with open(description_path, "r", encoding="utf-8") as desc_f:
+                description_text = desc_f.read().strip()
+            if description_text:
+                log(f"Auto-detected description sidecar for {filename}: {os.path.basename(description_path)}")
+                if set_description(session, host, asset_id, description_text):
+                    description_bound = True
+                else:
+                    log(f"Warning: description sidecar found for {filename} but PUT /api/assets/{asset_id} failed -- upload itself still succeeded")
+        except Exception as e:
+            log(f"Warning: error reading description sidecar {description_path}: {e}")
+
+    return {
+        "success": True,
+        "filename": filename,
+        "id": asset_id,
+        "status": status,
+        "checksum": checksum,
+        "has_sidecar": sidecar_path is not None,
+        "has_description": description_bound,
+    }
 
 
 def main():
@@ -316,7 +323,7 @@ def main():
         response = session.put(
             f"{host}/api/albums/{album_id}/assets",
             json={"ids": uploaded_asset_ids},
-            timeout=60,
+            timeout=(10, 60),
         )
         if response.status_code != 200:
             log(f"Warning: album assignment failed. HTTP {response.status_code}: {response.text}")
@@ -333,7 +340,7 @@ def main():
         response = session.put(
             f"{host}/api/tags/assets",
             json={"tagIds": tag_ids, "assetIds": uploaded_asset_ids},
-            timeout=60,
+            timeout=(10, 60),
         )
         if response.status_code != 200:
             log(f"Warning: tag assignment failed. HTTP {response.status_code}: {response.text}")
