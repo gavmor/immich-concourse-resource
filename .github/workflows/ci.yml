@@ -16,12 +16,18 @@ env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}
 
 jobs:
-  # PRs only: prove the Dockerfile still builds. Never pushes an image.
+  # PRs: fast Docker build validation and in-memory contract unit testing.
   build-validate:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install requests==2.34.2
+      - name: Run contract unit test against in-memory mock server
+        run: python3 test/test_contract.py
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
         with:
