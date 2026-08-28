@@ -124,7 +124,7 @@ Mitigation actually available: **serialize** any pipeline jobs that might create
 
 | Trigger | Job | What happens |
 |---|---|---|
-| Pull request | `build-validate` | Builds the Dockerfile (no push). Catches a broken image before merge. |
+| Pull request | `build-validate` | Runs `test/test_contract.py` (a zero-dependency contract test against an in-memory mock Immich server), then builds the Dockerfile (no push). Catches a broken request/response contract or a broken image before merge. |
 | Push to `main` | `publish` | Builds and pushes `:latest` and `:edge-<short-sha>`. |
 | Push to `main` | `e2e` | Stands up a real Immich instance (the project's own official release `docker-compose.yml`), bootstraps an admin account and API key via the live API, and runs `test/run_e2e_test.sh` against it. |
 | Push of a `vX.Y.Z` tag | `publish` | Builds and pushes semver tags: `X.Y.Z`, `X.Y`, `X`. |
@@ -142,12 +142,20 @@ No manual visibility step needed: verified directly against the live package aft
 docker build -t immich-concourse-resource .
 ```
 
-## End-to-end test
+## Testing
 
-`test/run_e2e_test.sh` is a self-contained, repeatable script: it generates two test PNGs (one with an XMP sidecar), runs `out` against a real Immich instance, verifies the resulting album/tag/sidecar state via the API, then deletes everything it created.
+There are two layers, matching the two CI jobs above:
 
-```
-IMMICH_HOST=http://localhost:2283 IMMICH_API_KEY=... ./test/run_e2e_test.sh
-```
+- **Contract test** (`test/test_contract.py`, runs on every PR): stands up an in-memory mock Immich HTTP server on an ephemeral loopback port and runs `out` against it as a real subprocess, asserting the exact request shapes (multipart upload, description PUT, tag upsert, bulk album/tag assignment) and the metadata `out` reports back. No dependencies beyond `requests` (already required by `out`), no Docker, no network — fast enough to run on every PR.
+
+  ```
+  python3 test/test_contract.py
+  ```
+
+- **End-to-end test** (`test/run_e2e_test.sh`, runs post-merge on `main`): a self-contained, repeatable script against a *real* Immich instance. It generates two test PNGs (one with an XMP sidecar), runs `out` against that instance, verifies the resulting album/tag/sidecar state via the API, then deletes everything it created.
+
+  ```
+  IMMICH_HOST=http://localhost:2283 IMMICH_API_KEY=... ./test/run_e2e_test.sh
+  ```
 
 See `test/e2e-test-log.md` for the narrative log of the debugging session that produced the fixes above (attempt-by-attempt, including the raw `curl` reproductions and the trash-purge incident) — a real run against a live local Immich v3.1.0 instance.
